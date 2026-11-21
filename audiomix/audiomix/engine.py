@@ -250,6 +250,38 @@ def _clip_contribution(c: dict[str, Any], x: np.ndarray, n0: int, n1: int) -> tu
     return nn - n0, contrib
 
 
+def render_sample_range(product: dict[str, Any], pcm_by_asset: dict[str, np.ndarray],
+                        n0: int, n1: int,
+                        clips_view: list[dict[str, Any]] | None = None,
+                        validate: bool = True) -> np.ndarray:
+    """渲染任意输出样本区间 [n0, n1) 的 PCM（int16）。
+
+    与分块渲染使用完全相同的逐 clip 累加次序与“先求和、再单次恰半取偶、
+    最后饱和”语义，只是块边界换成调用方给的任意边界。导览编排按设备包长
+    切包时需要精确到设备采样边界，因此提供这个原语。
+    """
+    if validate:
+        validate_product(product, pcm_by_asset)
+    if n0 < 0 or n1 < n0:
+        raise ValueError(f"非法样本区间 [{n0},{n1})")
+    if n0 == n1:
+        return np.empty(0, dtype=np.int16)
+    clips = clips_view if clips_view is not None else product_clip_view(product)
+    acc = np.zeros(n1 - n0, dtype=np.float64)
+    try:
+        for c in clips:
+            local_idx, contrib = _clip_contribution(
+                c, pcm_by_asset[c["asset_id"]], n0, n1)
+            if len(local_idx):
+                acc[local_idx] += contrib
+    except OverflowError:
+        full = render_reference(product, pcm_by_asset,
+                                Fraction(n1, OUTPUT_RATE), n0=n0, n1=n1)
+        return full.astype(np.int16)
+    rounded = np.rint(acc)
+    return np.clip(rounded, -32768, 32767).astype(np.int16)
+
+
 def render_block(product: dict[str, Any], pcm_by_asset: dict[str, np.ndarray],
                  block_index: int, T: Any,
                  clips_view: list[dict[str, Any]] | None = None) -> dict[str, Any]:

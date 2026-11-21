@@ -1,13 +1,16 @@
-# 多采样率剪辑时间轴与真实混音档案（audiomix）
+# 多采样率剪辑时间轴、真实混音档案与有声导览（audiomix）
 
 纯 Python 3.11 实现（NumPy/SciPy/标准 `wave`），无视频、无音频设备、无网页。
-两个独立服务：
+三个服务：
 
 1. **可独立编辑的音频时间轴服务**（`audiomix/timeline.py`）：插入/移动/修改/删除/
    区间查询/发布，clip 身份独立于素材，有理数时间，不渲染即可点查询。
 2. **实际混音数据仓**（`audiomix/archive.py`）：只消费不可变发布产品与实际素材字节，
    固定 16kHz 输出，按固定样本块存档，内容寻址复用，支持范围读取与逐块追溯；
    不读取编辑器私有操作日志，也接受外部合法时间轴产品。
+3. **有声导览编排**（`audiomix/packets.py` + `audiomix/guide.py`）：把"某产品版 /
+   某 clip 实例 / 某段源样本"编译成设备整包，在展厅路线图上给出能保障所有路线的
+   非预知装载方案，或给出冲突证据；可逐路回放真实字节并出收听记录。
 
 ## 目录
 
@@ -16,11 +19,13 @@ audiomix/
   rationals.py   精确有理数（Fraction）表示与边界整数运算
   assets.py      PCM WAV 生成/读取 + 素材登记仓（asset_id=正文 SHA-256，绑定摘要/样本数）
   timeline.py    时间轴编辑器（整笔校验、点查询、不可变发布产品）
-  engine.py      混音引擎：逐样本参考解释器 + 等价的 NumPy 分块向量化渲染
+  engine.py      混音引擎：逐样本参考解释器 + 等价的 NumPy 分块/任意区间渲染
   archive.py     混音数据仓：内容寻址块存储 + SQLite 依赖索引 + 增量渲染 + 读取/追溯
+  packets.py     导览段编译：段引用解析、任意区间真实混音、固定包长切整包、内容寻址包仓
+  guide.py       展厅路线图 + 设备缓存 + 非预知装载规划 + 冲突证据 + 逐路回放/符号验证
   cli.py         命令行入口
-tests/           手算案例、数据仓案例、边界语义测试
-demo/            30 素材/100 clip/120s 规模案例与 CLI 端到端走查
+tests/           手算案例、数据仓案例、边界语义、导览编排案例
+demo/            30 素材/100 clip/120s 规模案例；45 展厅/768 路线的导览规模案例
 run_all_checks.sh 一键全量验证
 ```
 
@@ -86,6 +91,67 @@ python3 -m audiomix.cli verify-integrity --archive-root DIR/archive
 
 完整端到端示例：`bash demo/cli_walkthrough.sh`；全量验证：`bash run_all_checks.sh`。
 
+## 有声导览：段编译、整包与"边走边选路"的装载
+
+路线图 JSON 为一个有限无环图（`route_map.json`）。每厅合同是一列窗口：
+`play`（所列段整包必须已就绪）、`transmit`（本窗口最多传 budget 个整包）。
+第一个 `play` 是入厅首包；全部窗口处理完后才揭晓后继分支。
+
+```jsonc
+{
+  "entrance": "A", "preload_budget": 2,
+  "halls": [
+    {"hall_id": "A", "windows": [{"type": "transmit", "budget": 2}],
+     "successors": ["B", "C"]},
+    {"hall_id": "B", "windows": [{"type": "play", "segments": [
+      {"product_id": "…", "clip_id": "c1", "src_a": 0, "src_b": 4}]}],
+     "successors": []},
+    {"hall_id": "C", "windows": [{"type": "play", "segments": [
+      {"product_id": "…", "clip_id": "c2", "src_a": 0, "src_b": 4}]}],
+     "successors": []}
+  ]
+}
+```
+
+- **段**明确引用 `(product_id 译制版本, clip_id 实例, 源区间 [src_a,src_b))`；
+  源区间必须是该 clip 自身 `[a,b)` 的子集，否则拒绝（绝不拿同素材的别的 clip 顶替）。
+  播放范围按原项目换算：`t = start + (p-a)/(源采样率×速度)`，输出样本
+  `n ∈ [ceil(16000·t0), ceil(16000·t1))`。段 PCM 是该区间上的**真实混音**
+  （重叠 clip 一并混入，与 `engine` 同语义）。
+- **整包**按设备固定包长切分，末包可短；包身份 `SHA-256(版本 ‖ 长度 ‖ 字节)`，
+  仅当译制版本/实际 PCM 字节/长度全一致才复用（内容寻址，跨厅共享单份存储）。
+- **规划**给出 `(展厅, 窗口, 当前缓存) -> 动作` 的非预知策略，保障路线图里
+  **每一条**完整路线都能无停顿播放，并遵守传输额度与缓存容量；不可行时返回
+  冲突证据（容量或传输额度不足，附各分支必须驻留的整包集合）。
+  大会图用 `(展厅,窗口,缓存)` 状态空间符号验证，**不逐条展开或复制整条路线的声音**。
+
+```bash
+# 校验路线图（入口/可达/路线条数，DP 计数不展开）
+python3 -m audiomix.cli route-map-validate --route-map route_map.json
+
+# 编译段 -> 整包：查询每段播放范围、每包字节；--cache 为设备缓存容量（整包数）
+python3 -m audiomix.cli guide-compile --route-map route_map.json \
+    --product p1.json --product p2.json --registry-root DIR/registry \
+    --packet-samples 1600 --cache 2
+
+# 规划：可行则给策略/预装；不可行则给冲突证据
+python3 -m audiomix.cli guide-plan --route-map route_map.json \
+    --product p1.json --product p2.json --registry-root DIR/registry --cache 2
+# 符号验证全部路线（状态空间，非逐条）
+python3 -m audiomix.cli guide-verify --route-map route_map.json \
+    --product p1.json --product p2.json --registry-root DIR/registry --cache 2
+# 按某条具体路线回放真实字节，导出 WAV
+python3 -m audiomix.cli guide-replay --route-map route_map.json \
+    --product p1.json --product p2.json --registry-root DIR/registry --cache 2 \
+    --route A B --wav route_ab.wav
+# 比较两种硬件租用条件（不同缓存容量）是否都能承诺无停顿路线
+python3 -m audiomix.cli guide-compare --route-map route_map.json \
+    --product p1.json --product p2.json --registry-root DIR/registry --cache 1 2
+```
+
+规模复演：`python3 -m demo.guide_scale_demo OUT`（45 展厅、768 条入口路线，
+真实短 WAV 编译成整包，抽样导出 WAV，并比较 7/8 包容量两种租用条件）。
+
 ## 验证策略（不使用任何外部混音结果）
 
 - `tests/test_hand_calc.py`：短整数序列素材，10 个案例人工推导每个输出样本
@@ -98,6 +164,13 @@ python3 -m audiomix.cli verify-integrity --archive-root DIR/archive
   “先求和后单次舍入”与“逐片段先舍入”的语义区分。
 - `demo/scale_demo.py`：30 素材（每采样率 10 个）、100 clip、120 秒/192 万样本，
   含全部要求情形；窗口化逐样本交叉核对，输出 WAV、块峰值、削顶数与来源索引。
+- `tests/test_guide.py`：复刻题面手算场景——B/C 入口分支（容量 1 冲突、容量 2 可行、
+  同译制版同首包时容量 1 也复用可行）、D 汇合不同余包（入口统一预装 vs 知情后分路
+  装载）、非预知性（入口动作唯一不依赖后揭晓分支）、源区间越界拒绝、任意区间渲染
+  与参考解释器一致、包复用仅按版本+字节+长度、全路线逐路回放与符号验证一致。
+- `demo/guide_scale_demo.py`：45 展厅/768 路线的交叉汇合路线图，3 个译制版本、
+  真实短 WAV 编译整包；符号验证约 700 个状态（不逐条存路线声音），比较 7/8 包容量
+  两种租用条件，输出抽样路线 WAV。
 
 参考解释器（`engine.render_reference`）是独立的纯 Python 逐样本 Fraction 实现，
 与向量化渲染路径代码完全分开，仅共享产品装载/校验，作为语义基准。

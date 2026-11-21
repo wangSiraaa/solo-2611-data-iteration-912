@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 import numpy as np
@@ -16,6 +17,7 @@ from .assets import AssetRegistry
 from .engine import (
     OUTPUT_RATE, render_full_vectorized, render_reference, validate_product,
 )
+from .guide import RouteMap
 from .rationals import as_r, dump_r
 from .timeline import TimelineEditor, ValidationError
 
@@ -232,6 +234,131 @@ def cmd_render_compare(p):
             "identical": bool(mismatch == 0)})
 
 
+# ----------------------------- 导览编排命令 ----------------------------- #
+
+def _load_lib_with_registry(paths, registry_root):
+    import json as _json
+    from .packets import ProductLibrary
+    lib = ProductLibrary()
+    reg = AssetRegistry(registry_root)
+    for path in paths:
+        product = _json.load(open(path, encoding="utf-8"))
+        pcm = {a["asset_id"]: reg.load_pcm(a["asset_id"])
+               for a in product["assets"]}
+        lib.add(product, pcm)
+    return lib
+
+
+def cmd_guide_compile(p):
+    from .guide import DeviceProfile, compile_guide
+    rm = _route_map_from_args(p)
+    lib = _load_lib_with_registry(p.product, p.registry_root)
+    dev = DeviceProfile(p.packet_samples, p.cache, p.device_name)
+    guide = compile_guide(rm, lib, dev)
+    out = {
+        "device": dev.to_json(),
+        "route_count": rm.route_count(),
+        "halls": len(rm.halls),
+        "distinct_packets": len(guide.store),
+        "packet_bytes": guide.store.total_bytes(),
+        "segments": [],
+    }
+    for (hall, wi, si), info in sorted(guide.segment_info.items()):
+        out["segments"].append({
+            "hall": hall, "window": wi, "segment_index": si,
+            "product_id": info["product_id"], "clip_id": info["clip_id"],
+            "output_time_range": info["output_time_range"],
+            "output_sample_range": info["output_sample_range"],
+            "output_samples": info["output_samples"],
+            "packets": info["packets"],
+            "packet_spans": info["packet_spans"],
+        })
+    _print(out)
+
+
+def cmd_guide_plan(p):
+    from .guide import DeviceProfile, Planner, compile_guide
+    rm = _route_map_from_args(p)
+    lib = _load_lib_with_registry(p.product, p.registry_root)
+    dev = DeviceProfile(p.packet_samples, p.cache, p.device_name)
+    guide = compile_guide(rm, lib, dev)
+    plan = Planner(guide).plan()
+    _print(plan.to_json())
+    if plan.feasible and p.record_out:
+        import json as _json
+        routes = rm.enumerate_routes(limit=p.route_limit)
+        records = {}
+        if p.route:
+            records["/".join(p.route)] = None  # 由下面统一填充
+        for path in routes[:p.record_routes]:
+            from .guide import simulate_path
+            records["/".join(path)] = simulate_path(guide, plan, path)
+        with open(p.record_out, "w", encoding="utf-8") as fh:
+            _json.dump(records, fh, ensure_ascii=False, indent=2)
+        print(f"# 收听记录 -> {p.record_out}", file=sys.stderr)
+
+
+def cmd_guide_compare(p):
+    from .guide import DeviceProfile, compare_profiles
+    rm = _route_map_from_args(p)
+    lib = _load_lib_with_registry(p.product, p.registry_root)
+    profiles = [DeviceProfile(p.packet_samples, c, f"cache{c}")
+                for c in p.cache]
+    _print(compare_profiles(rm, lib, profiles))
+
+
+def cmd_guide_replay(p):
+    import wave
+    from .guide import (
+        DeviceProfile, Planner, compile_guide, simulate_path,
+    )
+    rm = _route_map_from_args(p)
+    lib = _load_lib_with_registry(p.product, p.registry_root)
+    dev = DeviceProfile(p.packet_samples, p.cache, p.device_name)
+    guide = compile_guide(rm, lib, dev)
+    plan = Planner(guide).plan()
+    if not plan.feasible:
+        _print({"feasible": False, "certificate": plan.certificate})
+        sys.exit(2)
+    rec = simulate_path(guide, plan, p.route)
+    pcm = guide.store.concatenate(rec["played_packets"])
+    if p.wav:
+        os.makedirs(os.path.dirname(os.path.abspath(p.wav)) or ".", exist_ok=True)
+        with wave.open(p.wav, "wb") as wf:
+            wf.setnchannels(1); wf.setsampwidth(2)
+            wf.setframerate(OUTPUT_RATE)
+            wf.writeframes(pcm.astype("<i2").tobytes())
+        rec["wav"] = p.wav
+    _print(rec)
+
+
+def cmd_guide_verify(p):
+    from .guide import DeviceProfile, Planner, compile_guide, verify_plan_symbolic
+    rm = _route_map_from_args(p)
+    lib = _load_lib_with_registry(p.product, p.registry_root)
+    dev = DeviceProfile(p.packet_samples, p.cache, p.device_name)
+    guide = compile_guide(rm, lib, dev)
+    plan = Planner(guide).plan()
+    if not plan.feasible:
+        _print({"feasible": False, "certificate": plan.certificate})
+        sys.exit(2)
+    _print({"feasible": True, "verify": verify_plan_symbolic(guide, plan)})
+
+
+def _route_map_from_args(p):
+    if getattr(p, "route_map", None):
+        return RouteMap.load(p.route_map)
+    raise SystemExit("需要 --route-map 指向路线图 JSON")
+
+
+def cmd_route_map_validate(p):
+    rm = RouteMap.load(p.route_map)
+    _print({"entrance": rm.entrance, "halls": len(rm.halls),
+            "route_count": rm.route_count(),
+            "preload_budget": rm.preload_budget,
+            "reachable": sorted(rm.reachable())})
+
+
 # ----------------------------- 参数解析 ----------------------------- #
 
 def build_parser() -> argparse.ArgumentParser:
@@ -329,6 +456,38 @@ def build_parser() -> argparse.ArgumentParser:
     q = sub.add_parser("render-compare"); q.add_argument("--product", required=True)
     q.add_argument("--registry-root", required=True); q.add_argument("--T", required=True)
     q.set_defaults(fn=cmd_render_compare)
+
+    # ---- 导览编排 ----
+    def guide_parser(name, fn, with_cache=True):
+        q = sub.add_parser(name)
+        q.add_argument("--route-map", required=True)
+        q.add_argument("--product", action="append", required=True,
+                       help="产品 JSON，可多次；产品素材从 --registry-root 读取")
+        q.add_argument("--registry-root", required=True)
+        q.add_argument("--packet-samples", type=int, default=1600)
+        if with_cache:
+            q.add_argument("--cache", type=int, default=4)
+        q.add_argument("--device-name", default="device")
+        q.set_defaults(fn=fn)
+        return q
+
+    q = sub.add_parser("route-map-validate")
+    q.add_argument("--route-map", required=True)
+    q.set_defaults(fn=cmd_route_map_validate)
+
+    q = guide_parser("guide-compile", cmd_guide_compile)
+    q = guide_parser("guide-plan", cmd_guide_plan)
+    q.add_argument("--record-out")
+    q.add_argument("--record-routes", type=int, default=5)
+    q.add_argument("--route-limit", type=int, default=100_000)
+    q.add_argument("--route", nargs="+")
+    q = guide_parser("guide-verify", cmd_guide_verify)
+    q = guide_parser("guide-replay", cmd_guide_replay)
+    q.add_argument("--route", nargs="+", required=True)
+    q.add_argument("--wav")
+    q = guide_parser("guide-compare", cmd_guide_compare, with_cache=False)
+    q.add_argument("--cache", type=int, nargs="+", required=True,
+                   help="若干缓存容量（整包数），逐个比较")
 
     return ap
 
